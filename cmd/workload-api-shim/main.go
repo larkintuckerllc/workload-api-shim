@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
 	"github.com/larkintuckerllc/workload-api-shim/internal/shimserver"
@@ -51,6 +52,7 @@ func main() {
 		grpc.ChainStreamInterceptor(workloadHeaderStreamInterceptor),
 	)
 	workloadv1.RegisterSpiffeWorkloadAPIServer(srv, shimserver.New(*credsDir))
+	reflection.Register(srv)
 
 	log.Printf("serving SPIFFE Workload API on unix://%s", *socketPath)
 	if err := srv.Serve(lis); err != nil {
