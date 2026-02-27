@@ -105,6 +105,83 @@ go run ./cmd/workload-api-shim \
 
 All RPCs require the `workload.spiffe.io: true` gRPC metadata header (per the SPIFFE Workload Endpoint spec). Calls without this header are rejected with `InvalidArgument`.
 
+## Container
+
+The image is built as a multi-arch manifest covering `linux/amd64` and `linux/arm64`. The build stage cross-compiles the Go binary for the target platform (no QEMU emulation), and the final image is based on `gcr.io/distroless/static-debian12:nonroot` — no shell, runs as non-root.
+
+### Prerequisites
+
+Enable [Docker BuildKit](https://docs.docker.com/build/buildkit/) and create a multi-platform builder if you haven't already:
+
+```bash
+docker buildx create --name multiarch --use
+docker buildx inspect --bootstrap
+```
+
+### Build and push a multi-arch image
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag <registry>/<image>:<tag> \
+  --push \
+  .
+```
+
+### Build locally (single arch, load into Docker daemon)
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --tag workload-api-shim:dev \
+  --load \
+  .
+```
+
+### Run the container
+
+The shim needs:
+- The credential directory bind-mounted to `--creds-dir`
+- The socket directory bind-mounted so the host (or a sidecar) can reach the Unix socket
+
+```bash
+docker run --rm \
+  -v /var/run/secrets/workload-spiffe-credentials:/var/run/secrets/workload-spiffe-credentials:ro \
+  -v /run/spiffe:/run/spiffe \
+  <registry>/<image>:<tag> \
+  --socket-path /run/spiffe/workload.sock \
+  --creds-dir /var/run/secrets/workload-spiffe-credentials
+```
+
+### Kubernetes (sidecar pattern)
+
+Mount the GKE Workload Identity credentials volume and share the socket via an `emptyDir`:
+
+```yaml
+volumes:
+  - name: spiffe-socket
+    emptyDir: {}
+  - name: workload-spiffe-credentials
+    projected:
+      sources:
+        - serviceAccountToken: ...  # GKE Workload Identity Federation volume
+
+initContainers:
+  - name: workload-api-shim
+    image: <registry>/<image>:<tag>
+    args:
+      - --socket-path=/run/spiffe/workload.sock
+      - --creds-dir=/var/run/secrets/workload-spiffe-credentials
+    volumeMounts:
+      - name: spiffe-socket
+        mountPath: /run/spiffe
+      - name: workload-spiffe-credentials
+        mountPath: /var/run/secrets/workload-spiffe-credentials
+        readOnly: true
+```
+
+Set `SPIFFE_ENDPOINT_SOCKET=unix:///run/spiffe/workload.sock` in workload containers that consume the API.
+
 ### Testing with grpcurl
 
 ```bash
