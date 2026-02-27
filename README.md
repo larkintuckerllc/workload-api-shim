@@ -153,37 +153,53 @@ docker run --rm \
   --creds-dir /var/run/secrets/workload-spiffe-credentials
 ```
 
-### Kubernetes (sidecar pattern)
+### Kubernetes (GKE Fleet sidecar pattern)
 
 The shim is a long-running process and must run alongside the main container, not before it. Use the [native sidecar container](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/) pattern available in Kubernetes 1.29+ by adding `restartPolicy: Always` to an `initContainers` entry. Kubernetes will start the sidecar before the main containers and keep it running for the lifetime of the pod.
 
-Mount the GKE Workload Identity credentials volume and share the socket via an `emptyDir`:
+On GKE, credentials are provisioned by the `podcertificate.gke.io` CSI driver. The socket is shared with the main container via an `emptyDir` volume.
 
 ```yaml
-volumes:
-  - name: spiffe-socket
-    emptyDir: {}
-  - name: workload-spiffe-credentials
-    projected:
-      sources:
-        - serviceAccountToken: ...  # GKE Workload Identity Federation volume
-
-initContainers:
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: debug
+  name: example
+spec:
+  initContainers:
   - name: workload-api-shim
     image: <registry>/<image>:<tag>
-    restartPolicy: Always          # native sidecar — runs alongside main containers
     args:
-      - --socket-path=/run/spiffe/workload.sock
-      - --creds-dir=/var/run/secrets/workload-spiffe-credentials
+    - --socket-path=/run/spiffe/workload.sock
+    - --creds-dir=/var/run/secrets/workload-spiffe-credentials
+    restartPolicy: Always
     volumeMounts:
-      - name: spiffe-socket
-        mountPath: /run/spiffe
-      - name: workload-spiffe-credentials
-        mountPath: /var/run/secrets/workload-spiffe-credentials
-        readOnly: true
+    - name: spiffe-socket
+      mountPath: /run/spiffe
+    - name: fleet-spiffe-credentials
+      mountPath: /var/run/secrets/workload-spiffe-credentials
+      readOnly: true
+  containers:
+  - name: main
+    image: <your-workload-image>
+    env:
+    - name: SPIFFE_ENDPOINT_SOCKET
+      value: unix:///run/spiffe/workload.sock
+    volumeMounts:
+    - name: spiffe-socket
+      mountPath: /run/spiffe
+  volumes:
+  - name: spiffe-socket
+    emptyDir: {}
+  - name: fleet-spiffe-credentials
+    csi:
+      driver: podcertificate.gke.io
+      volumeAttributes:
+        signerName: spiffe.gke.io/fleet-svid
+        trustDomain: <fleet-project>/svc.id.goog
 ```
 
-Set `SPIFFE_ENDPOINT_SOCKET=unix:///run/spiffe/workload.sock` in workload containers that consume the API.
+Replace `<registry>/<image>:<tag>`, `<your-workload-image>`, and `<fleet-project>` with your values.
 
 ### Testing with grpcurl
 
