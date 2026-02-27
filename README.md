@@ -155,6 +155,8 @@ docker run --rm \
 
 ### Kubernetes (sidecar pattern)
 
+The shim is a long-running process and must run alongside the main container, not before it. Use the [native sidecar container](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/) pattern available in Kubernetes 1.29+ by adding `restartPolicy: Always` to an `initContainers` entry. Kubernetes will start the sidecar before the main containers and keep it running for the lifetime of the pod.
+
 Mount the GKE Workload Identity credentials volume and share the socket via an `emptyDir`:
 
 ```yaml
@@ -169,6 +171,7 @@ volumes:
 initContainers:
   - name: workload-api-shim
     image: <registry>/<image>:<tag>
+    restartPolicy: Always          # native sidecar — runs alongside main containers
     args:
       - --socket-path=/run/spiffe/workload.sock
       - --creds-dir=/var/run/secrets/workload-spiffe-credentials
