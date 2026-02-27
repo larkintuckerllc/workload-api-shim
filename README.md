@@ -219,12 +219,12 @@ Then test the header enforcement and SVID fetch:
 kubectl exec -n debug example -c main -- \
   grpcurl -plaintext \
   unix:///run/spiffe/workload.sock \
-  spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID
+  SpiffeWorkloadAPI/FetchX509SVID
 
 # With required header → streams SVID response
 kubectl exec -n debug example -c main -- \
   grpcurl -plaintext \
   -H 'workload.spiffe.io: true' \
   unix:///run/spiffe/workload.sock \
-  spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID
+  SpiffeWorkloadAPI/FetchX509SVID
 ```
