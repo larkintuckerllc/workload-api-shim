@@ -203,13 +203,26 @@ Replace `<registry>/<image>:<tag>`, `<your-workload-image>`, and `<fleet-project
 
 ### Testing with grpcurl
 
+Using the pod example above, exec into the `main` container and install `grpcurl`:
+
+```bash
+kubectl exec -n debug example -c main -- bash -c '
+  curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_amd64.tar.gz \
+    | tar -xz -C /usr/local/bin grpcurl
+'
+```
+
+Then test the header enforcement and SVID fetch:
+
 ```bash
 # Missing header → InvalidArgument
-grpcurl -plaintext -unix /tmp/test.sock \
+kubectl exec -n debug example -c main -- \
+  grpcurl -plaintext -unix /run/spiffe/workload.sock \
   spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID
 
 # With required header → streams SVID response
-grpcurl -plaintext -unix /tmp/test.sock \
+kubectl exec -n debug example -c main -- \
+  grpcurl -plaintext -unix /run/spiffe/workload.sock \
   -H 'workload.spiffe.io: true' \
   spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID
 ```
