@@ -3,6 +3,7 @@ module github.com/larkintuckerllc/workload-api-shim
 go 1.24.0
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/spiffe/go-spiffe/v2 v2.6.0
 	google.golang.org/grpc v1.79.1
 )

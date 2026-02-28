@@ -51,7 +51,11 @@ func main() {
 		grpc.ChainUnaryInterceptor(workloadHeaderUnaryInterceptor),
 		grpc.ChainStreamInterceptor(workloadHeaderStreamInterceptor),
 	)
-	workloadv1.RegisterSpiffeWorkloadAPIServer(srv, shimserver.New(*credsDir))
+	shim, err := shimserver.New(*credsDir)
+	if err != nil {
+		log.Fatalf("failed to initialize shim: %v", err)
+	}
+	workloadv1.RegisterSpiffeWorkloadAPIServer(srv, shim)
 	reflection.Register(srv)
 
 	log.Printf("serving SPIFFE Workload API on unix://%s", *socketPath)

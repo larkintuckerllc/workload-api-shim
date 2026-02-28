@@ -7,23 +7,114 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	workloadv1 "github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+// broadcaster fans out a rotation signal to all subscribed streams.
+type broadcaster struct {
+	mu   sync.Mutex
+	subs map[int]chan struct{}
+	next int
+}
+
+func newBroadcaster() *broadcaster {
+	return &broadcaster{subs: make(map[int]chan struct{})}
+}
+
+func (b *broadcaster) subscribe() (int, <-chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := b.next
+	b.next++
+	ch := make(chan struct{}, 1)
+	b.subs[id] = ch
+	return id, ch
+}
+
+func (b *broadcaster) unsubscribe(id int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.subs, id)
+}
+
+func (b *broadcaster) broadcast() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.subs {
+		select {
+		case ch <- struct{}{}:
+		default: // drop if subscriber hasn't consumed the previous signal yet
+		}
+	}
+}
+
 // ShimServer implements the SPIFFE Workload API by reading credentials from disk.
 type ShimServer struct {
 	workloadv1.UnimplementedSpiffeWorkloadAPIServer
 	credsDir string
+	bcast    *broadcaster
 }
 
-// New creates a ShimServer that reads credentials from credsDir.
-func New(credsDir string) *ShimServer {
-	return &ShimServer{credsDir: credsDir}
+// New creates a ShimServer that reads credentials from credsDir and watches
+// for credential rotation, pushing updates to all connected streams.
+func New(credsDir string) (*ShimServer, error) {
+	s := &ShimServer{
+		credsDir: credsDir,
+		bcast:    newBroadcaster(),
+	}
+	if err := s.startWatcher(); err != nil {
+		return nil, fmt.Errorf("start credential watcher: %w", err)
+	}
+	return s, nil
+}
+
+// startWatcher watches credsDir for file changes and broadcasts to active streams.
+// Changes are debounced by 100ms to coalesce rapid multi-file rotation events.
+func (s *ShimServer) startWatcher() error {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	if err := w.Add(s.credsDir); err != nil {
+		w.Close()
+		return err
+	}
+	go func() {
+		defer w.Close()
+		var debounce *time.Timer
+		for {
+			select {
+			case event, ok := <-w.Events:
+				if !ok {
+					return
+				}
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+					if debounce != nil {
+						debounce.Stop()
+					}
+					debounce = time.AfterFunc(100*time.Millisecond, func() {
+						log.Println("credentials rotated, pushing update to connected streams")
+						s.bcast.broadcast()
+					})
+				}
+			case err, ok := <-w.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("credential watcher error: %v", err)
+			}
+		}
+	}()
+	return nil
 }
 
 // loadPEMDERs decodes all PEM blocks in the named file and returns each block as raw DER bytes.
@@ -116,86 +207,70 @@ func concatDERs(ders [][]byte) []byte {
 	return out
 }
 
-// FetchX509SVID streams the X.509 SVID and holds the stream open until the client disconnects.
-func (s *ShimServer) FetchX509SVID(_ *workloadv1.X509SVIDRequest, stream workloadv1.SpiffeWorkloadAPI_FetchX509SVIDServer) error {
+// buildX509SVIDResponse reads the current credentials from disk and builds the response.
+func (s *ShimServer) buildX509SVIDResponse() (*workloadv1.X509SVIDResponse, error) {
 	certDERs, err := s.loadPEMDERs("certificates.pem")
 	if err != nil {
-		return status.Errorf(codes.Internal, "load certificates: %v", err)
+		return nil, fmt.Errorf("load certificates: %w", err)
 	}
 	if len(certDERs) == 0 {
-		return status.Error(codes.Internal, "no certificates found in certificates.pem")
+		return nil, fmt.Errorf("no certificates found in certificates.pem")
 	}
-
 	keyDER, err := s.loadPrivateKeyPKCS8DER("private_key.pem")
 	if err != nil {
-		return status.Errorf(codes.Internal, "load private key: %v", err)
+		return nil, fmt.Errorf("load private key: %w", err)
 	}
-
 	caDERs, err := s.loadPEMDERs("ca_certificates.pem")
 	if err != nil {
-		return status.Errorf(codes.Internal, "load CA certificates: %v", err)
+		return nil, fmt.Errorf("load CA certificates: %w", err)
 	}
-
 	leaf, err := x509.ParseCertificate(certDERs[0])
 	if err != nil {
-		return status.Errorf(codes.Internal, "parse leaf certificate: %v", err)
+		return nil, fmt.Errorf("parse leaf certificate: %w", err)
 	}
 	if len(leaf.URIs) == 0 {
-		return status.Error(codes.Internal, "leaf certificate has no URI SANs")
+		return nil, fmt.Errorf("leaf certificate has no URI SANs")
 	}
-	spiffeID := leaf.URIs[0].String()
-
-	resp := &workloadv1.X509SVIDResponse{
+	return &workloadv1.X509SVIDResponse{
 		Svids: []*workloadv1.X509SVID{
 			{
-				SpiffeId:    spiffeID,
+				SpiffeId:    leaf.URIs[0].String(),
 				X509Svid:    concatDERs(certDERs),
 				X509SvidKey: keyDER,
 				Bundle:      concatDERs(caDERs),
 			},
 		},
-	}
-	if err := stream.Send(resp); err != nil {
-		return err
-	}
-
-	<-stream.Context().Done()
-	return nil
+	}, nil
 }
 
-// FetchX509Bundles streams the X.509 trust bundle map and holds the stream open until the client disconnects.
-func (s *ShimServer) FetchX509Bundles(_ *workloadv1.X509BundlesRequest, stream workloadv1.SpiffeWorkloadAPI_FetchX509BundlesServer) error {
+// buildX509BundlesResponse reads the current trust bundles from disk and builds the response.
+func (s *ShimServer) buildX509BundlesResponse() (*workloadv1.X509BundlesResponse, error) {
 	certDERs, err := s.loadPEMDERs("certificates.pem")
 	if err != nil {
-		return status.Errorf(codes.Internal, "load certificates: %v", err)
+		return nil, fmt.Errorf("load certificates: %w", err)
 	}
 	if len(certDERs) == 0 {
-		return status.Error(codes.Internal, "no certificates found in certificates.pem")
+		return nil, fmt.Errorf("no certificates found in certificates.pem")
 	}
-
 	leaf, err := x509.ParseCertificate(certDERs[0])
 	if err != nil {
-		return status.Errorf(codes.Internal, "parse leaf certificate: %v", err)
+		return nil, fmt.Errorf("parse leaf certificate: %w", err)
 	}
 	if len(leaf.URIs) == 0 {
-		return status.Error(codes.Internal, "leaf certificate has no URI SANs")
+		return nil, fmt.Errorf("leaf certificate has no URI SANs")
 	}
 	localTD := "spiffe://" + leaf.URIs[0].Host
 
 	caDERs, err := s.loadPEMDERs("ca_certificates.pem")
 	if err != nil {
-		return status.Errorf(codes.Internal, "load CA certificates: %v", err)
+		return nil, fmt.Errorf("load CA certificates: %w", err)
 	}
-
-	bundles := map[string][]byte{
-		localTD: concatDERs(caDERs),
-	}
+	bundles := map[string][]byte{localTD: concatDERs(caDERs)}
 
 	tb, err := s.loadTrustBundles()
 	if err != nil {
-		return status.Errorf(codes.Internal, "load trust bundles: %v", err)
+		return nil, fmt.Errorf("load trust bundles: %w", err)
 	}
-
 	for domain, entry := range tb.TrustDomains {
 		tdKey := "spiffe://" + domain
 		if tdKey == localTD {
@@ -209,7 +284,7 @@ func (s *ShimServer) FetchX509Bundles(_ *workloadv1.X509BundlesRequest, stream w
 			for _, b64cert := range key.X5C {
 				der, err := base64.StdEncoding.DecodeString(b64cert)
 				if err != nil {
-					return status.Errorf(codes.Internal, "decode x5c entry for domain %s: %v", domain, err)
+					return nil, fmt.Errorf("decode x5c entry for domain %s: %w", domain, err)
 				}
 				ders = append(ders, der)
 			}
@@ -218,26 +293,15 @@ func (s *ShimServer) FetchX509Bundles(_ *workloadv1.X509BundlesRequest, stream w
 			bundles[tdKey] = concatDERs(ders)
 		}
 	}
-
-	resp := &workloadv1.X509BundlesResponse{
-		Bundles: bundles,
-	}
-	if err := stream.Send(resp); err != nil {
-		return err
-	}
-
-	<-stream.Context().Done()
-	return nil
+	return &workloadv1.X509BundlesResponse{Bundles: bundles}, nil
 }
 
-// FetchJWTBundles streams the JWT bundle map (currently empty — no jwt-svid keys in credential files)
-// and holds the stream open until the client disconnects.
-func (s *ShimServer) FetchJWTBundles(_ *workloadv1.JWTBundlesRequest, stream workloadv1.SpiffeWorkloadAPI_FetchJWTBundlesServer) error {
+// buildJWTBundlesResponse reads the current trust bundles from disk and builds the response.
+func (s *ShimServer) buildJWTBundlesResponse() (*workloadv1.JWTBundlesResponse, error) {
 	tb, err := s.loadTrustBundles()
 	if err != nil {
-		return status.Errorf(codes.Internal, "load trust bundles: %v", err)
+		return nil, fmt.Errorf("load trust bundles: %w", err)
 	}
-
 	bundles := make(map[string][]byte)
 	for domain, entry := range tb.TrustDomains {
 		var keys []json.RawMessage
@@ -247,7 +311,7 @@ func (s *ShimServer) FetchJWTBundles(_ *workloadv1.JWTBundlesRequest, stream wor
 			}
 			b, err := json.Marshal(key)
 			if err != nil {
-				return status.Errorf(codes.Internal, "marshal jwt key for domain %s: %v", domain, err)
+				return nil, fmt.Errorf("marshal jwt key for domain %s: %w", domain, err)
 			}
 			keys = append(keys, b)
 		}
@@ -259,20 +323,101 @@ func (s *ShimServer) FetchJWTBundles(_ *workloadv1.JWTBundlesRequest, stream wor
 		}{Keys: keys}
 		jwksJSON, err := json.Marshal(jwks)
 		if err != nil {
-			return status.Errorf(codes.Internal, "marshal jwks for domain %s: %v", domain, err)
+			return nil, fmt.Errorf("marshal jwks for domain %s: %w", domain, err)
 		}
 		bundles["spiffe://"+domain] = jwksJSON
 	}
+	return &workloadv1.JWTBundlesResponse{Bundles: bundles}, nil
+}
 
-	resp := &workloadv1.JWTBundlesResponse{
-		Bundles: bundles,
+// FetchX509SVID streams the X.509 SVID and pushes updates whenever credentials rotate.
+func (s *ShimServer) FetchX509SVID(_ *workloadv1.X509SVIDRequest, stream workloadv1.SpiffeWorkloadAPI_FetchX509SVIDServer) error {
+	resp, err := s.buildX509SVIDResponse()
+	if err != nil {
+		return status.Errorf(codes.Internal, "%v", err)
 	}
 	if err := stream.Send(resp); err != nil {
 		return err
 	}
 
-	<-stream.Context().Done()
-	return nil
+	id, rotated := s.bcast.subscribe()
+	defer s.bcast.unsubscribe(id)
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-rotated:
+			resp, err := s.buildX509SVIDResponse()
+			if err != nil {
+				log.Printf("FetchX509SVID: reload failed: %v", err)
+				continue
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// FetchX509Bundles streams the X.509 trust bundle map and pushes updates whenever credentials rotate.
+func (s *ShimServer) FetchX509Bundles(_ *workloadv1.X509BundlesRequest, stream workloadv1.SpiffeWorkloadAPI_FetchX509BundlesServer) error {
+	resp, err := s.buildX509BundlesResponse()
+	if err != nil {
+		return status.Errorf(codes.Internal, "%v", err)
+	}
+	if err := stream.Send(resp); err != nil {
+		return err
+	}
+
+	id, rotated := s.bcast.subscribe()
+	defer s.bcast.unsubscribe(id)
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-rotated:
+			resp, err := s.buildX509BundlesResponse()
+			if err != nil {
+				log.Printf("FetchX509Bundles: reload failed: %v", err)
+				continue
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// FetchJWTBundles streams the JWT bundle map and pushes updates whenever credentials rotate.
+func (s *ShimServer) FetchJWTBundles(_ *workloadv1.JWTBundlesRequest, stream workloadv1.SpiffeWorkloadAPI_FetchJWTBundlesServer) error {
+	resp, err := s.buildJWTBundlesResponse()
+	if err != nil {
+		return status.Errorf(codes.Internal, "%v", err)
+	}
+	if err := stream.Send(resp); err != nil {
+		return err
+	}
+
+	id, rotated := s.bcast.subscribe()
+	defer s.bcast.unsubscribe(id)
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-rotated:
+			resp, err := s.buildJWTBundlesResponse()
+			if err != nil {
+				log.Printf("FetchJWTBundles: reload failed: %v", err)
+				continue
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // FetchJWTSVID is not supported — no JWT signing keys are present in the credential files.
