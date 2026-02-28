@@ -97,13 +97,19 @@ go run ./cmd/workload-api-shim \
 
 | RPC | Type | Behavior |
 |---|---|---|
-| `FetchX509SVID` | server-stream | Returns the X.509 SVID and holds the stream open |
-| `FetchX509Bundles` | server-stream | Returns local and federated X.509 trust bundles and holds the stream open |
-| `FetchJWTBundles` | server-stream | Returns JWT trust bundles (empty when no `jwt-svid` keys are present) and holds the stream open |
+| `FetchX509SVID` | server-stream | Sends the X.509 SVID immediately, then pushes a new response whenever credentials rotate |
+| `FetchX509Bundles` | server-stream | Sends local and federated X.509 trust bundles immediately, then pushes updates on rotation |
+| `FetchJWTBundles` | server-stream | Sends JWT trust bundles immediately (empty when no `jwt-svid` keys are present), then pushes updates on rotation |
 | `FetchJWTSVID` | unary | Returns `Unimplemented` — no JWT signing keys in credential files |
 | `ValidateJWTSVID` | unary | Returns `Unimplemented` — no JWT signing keys in credential files |
 
 All RPCs require the `workload.spiffe.io: true` gRPC metadata header (per the SPIFFE Workload Endpoint spec). Calls without this header are rejected with `InvalidArgument`.
+
+### Credential rotation
+
+The shim watches the credentials directory with `fsnotify`. When any credential file changes, it re-reads all files and pushes an updated response on every open stream — no client reconnect is required. Changes are debounced by 100ms to handle the burst of write events that occurs when all four files are rotated simultaneously.
+
+On GKE, the `podcertificate.gke.io` CSI driver rotates credentials at 50% of the certificate lifetime (default: every 12 hours for a 1-day cert). Connected workloads will receive the new certificate automatically over their existing stream.
 
 ## Container
 
